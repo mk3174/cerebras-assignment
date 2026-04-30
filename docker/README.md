@@ -58,8 +58,7 @@ docker run --rm -it --platform=linux/amd64 --privileged \
   topk-knn-sdk
 ```
 
-Inside the container, run `cslc`, `cs_python`, `csdb`, and `pytest` as
-documented in the main README and SPEC.
+ 
 
 `--privileged` is needed for Apptainer's kernel features (namespaces, overlay,
 fuse mounts) inside Docker. If your Docker host has user-namespace remapping
