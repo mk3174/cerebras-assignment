@@ -1,0 +1,315 @@
+// PE program for top-K kNN on a P×P grid. See layout.csl for the data-flow overview.
+//
+// Per-PE state machine (driven through driver_task; one task ID, advanced by .state):
+//
+//   state 0 : init mpi_x / mpi_y, then mpi_y.broadcast(q) down column 0
+//   state 1 : mpi_x.broadcast(q) across each row
+//   state 2 : compute R local distances; local select_top_k → topk_(dist,idx); pack into topk_pairs
+//   state 3 : mpi_x.gather row's P top-K pair-arrays into row_gather_buf at (P-1, py)
+//   state 4 : at (P-1, py): select_top_k(P*K → K); re-pack into topk_pairs
+//   state 5 : at column P-1 only: mpi_y.gather column's P top-K pair-arrays into col_gather_buf at (P-1, P-1)
+//   state 6 : at (P-1, P-1): select_top_k(P*K → K); write into out_dist / out_idx
+//   state 7+: unblock_cmd_stream on every PE → host launch returns
+//
+// All data carried over the fabric is u32. (dist:f32, global_idx:u32) is encoded as
+// two consecutive u32 wavelets: bitcast<u32>(dist), then idx.
+//
+// Tie-break: lex-compare (dist asc, idx asc). Indices are global (computed from PE
+// coordinates + local row), so equal distances always have distinct keys → deterministic.
+
+param memcpy_params;
+param c2d_params;
+param P:           u16;
+param d_dim:       u16;
+param rows_per_pe: u16;
+param K:           u16;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+const mpi_x   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
+const mpi_y   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
+
+// Task IDs
+const driver_task_id: local_task_id = @get_local_task_id(8);
+
+// Aliases / derived constants
+const R:         u16 = rows_per_pe;
+const PAIR_U32:  u16 = 2;          // each (dist, idx) is 2 u32 wavelets
+const PK:        u16 = P * K;      // total pairs gathered per merge stage
+const PK_U32:    u16 = PK * PAIR_U32;
+
+// f32 +inf bit pattern, used as a "consumed" / "padding" sentinel for distance.
+const INF_F32_BITS: u32 = 0x7F800000;
+// Index sentinel for consumed entries (well above any valid global index).
+const SENTINEL_IDX: u32 = 0xFFFFFFFF;
+
+// ---------------------------------------------------------------------------
+// Per-PE input buffers (filled by the host via memcpy_h2d).
+// ---------------------------------------------------------------------------
+var D_tile_arr: [rows_per_pe * d_dim]f32;
+var D_tile:     [*]f32 = &D_tile_arr;
+
+var q_arr: [d_dim]f32 = @zeros([d_dim]f32);
+var q_ptr: [*]f32 = &q_arr;
+
+// ---------------------------------------------------------------------------
+// Per-PE output buffers — only meaningful at PE (P-1, P-1).
+// ---------------------------------------------------------------------------
+var out_dist_arr: [K]f32 = @zeros([K]f32);
+var out_dist:     [*]f32 = &out_dist_arr;
+
+var out_idx_arr:  [K]u32 = @zeros([K]u32);
+var out_idx:      [*]u32 = &out_idx_arr;
+
+// ---------------------------------------------------------------------------
+// Per-PE scratch.
+// ---------------------------------------------------------------------------
+
+// Local distance / global-index arrays (one entry per local D row).
+var dist_arr: [rows_per_pe]f32 = @zeros([rows_per_pe]f32);
+var idx_arr:  [rows_per_pe]u32 = @zeros([rows_per_pe]u32);
+
+// Local top-K, sorted ascending by lex (dist, idx).
+var topk_dist: [K]f32 = @zeros([K]f32);
+var topk_idx:  [K]u32 = @zeros([K]u32);
+
+// Packed-for-fabric form: [bits(dist0), idx0, bits(dist1), idx1, ...].
+var topk_pairs: [K * PAIR_U32]u32 = @zeros([K * PAIR_U32]u32);
+
+// Row-gather receive buffer at (P-1, py) — collects P PEs' top-K pair-arrays.
+// Allocated on every PE for simplicity; only used at px = P-1.
+var row_gather_buf: [P * K * PAIR_U32]u32 = @zeros([P * K * PAIR_U32]u32);
+
+// Column-gather receive buffer at (P-1, P-1) — collects P merged top-K's from the
+// rightmost column. Only used at (P-1, P-1).
+var col_gather_buf: [P * K * PAIR_U32]u32 = @zeros([P * K * PAIR_U32]u32);
+
+// Unpacked merge scratch: holds up to P*K (dist, idx) pairs to feed select_top_k.
+var merge_dist_scratch: [P * K]f32 = @zeros([P * K]f32);
+var merge_idx_scratch:  [P * K]u32 = @zeros([P * K]u32);
+
+// Runtime PE coordinates within the kernel rectangle (set in state 0 from collectives).
+var px: u16 = 0;
+var py: u16 = 0;
+
+// State-machine cursor.
+var state: u16 = 0;
+
+// ---------------------------------------------------------------------------
+// Helpers.
+// ---------------------------------------------------------------------------
+
+// Compute the R local distances and assign their global indices.
+fn compute_local_distances() void {
+  // Global row index of the PE's first local row.
+  const my_row_base: u32 =
+      (@as(u32, py) * @as(u32, P) + @as(u32, px)) * @as(u32, R);
+
+  for (@range(u16, R)) |i| {
+    var sum: f32 = 0.0;
+    for (@range(u16, d_dim)) |j| {
+      const diff: f32 = D_tile_arr[i * d_dim + j] - q_arr[j];
+      sum += diff * diff;
+    }
+    dist_arr[i] = sum;
+    idx_arr[i]  = my_row_base + @as(u32, i);
+  }
+}
+
+// Selection-of-K from an n-element (dist, idx) array. Mutates the source by marking
+// consumed entries with (+inf, SENTINEL_IDX). Output is sorted ascending by lex
+// (dist, idx). Caller must guarantee n >= k.
+fn select_top_k(
+    n: u16,
+    src_dist: [*]f32,
+    src_idx:  [*]u32,
+    dst_dist: [*]f32,
+    dst_idx:  [*]u32,
+    k: u16,
+) void {
+  const inf_f: f32 = @bitcast(f32, INF_F32_BITS);
+
+  var k_iter: u16 = 0;
+  while (k_iter < k) : (k_iter += 1) {
+    var best_pos:  u16 = 0;
+    var best_dist: f32 = src_dist[0];
+    var best_idx:  u32 = src_idx[0];
+
+    var i: u16 = 1;
+    while (i < n) : (i += 1) {
+      const di: f32 = src_dist[i];
+      const ii: u32 = src_idx[i];
+      // (di, ii) <_lex (best_dist, best_idx)
+      const lt: bool = (di < best_dist) or ((di == best_dist) and (ii < best_idx));
+      if (lt) {
+        best_pos  = i;
+        best_dist = di;
+        best_idx  = ii;
+      }
+    }
+
+    dst_dist[k_iter] = best_dist;
+    dst_idx[k_iter]  = best_idx;
+
+    // Mark consumed so it loses every future comparison.
+    src_dist[best_pos] = inf_f;
+    src_idx[best_pos]  = SENTINEL_IDX;
+  }
+}
+
+// Pack topk_(dist,idx) → topk_pairs as alternating u32 words for the fabric.
+fn pack_topk_pairs() void {
+  for (@range(u16, K)) |i| {
+    topk_pairs[i * PAIR_U32]     = @bitcast(u32, topk_dist[i]);
+    topk_pairs[i * PAIR_U32 + 1] = topk_idx[i];
+  }
+}
+
+// Inverse of pack_topk_pairs for an arbitrary [n_pairs * 2] u32 source.
+fn unpack_pairs(
+    src:      [*]u32,
+    n_pairs:  u16,
+    dst_dist: [*]f32,
+    dst_idx:  [*]u32,
+) void {
+  for (@range(u16, n_pairs)) |i| {
+    dst_dist[i] = @bitcast(f32, src[i * PAIR_U32]);
+    dst_idx[i]  = src[i * PAIR_U32 + 1];
+  }
+}
+
+// Row-merge stage: at (P-1, py), reduce the P*K pairs in row_gather_buf back to K.
+// Re-packs the merged top-K into topk_pairs so the next gather (along y) finds it.
+fn row_merge_top_k() void {
+  unpack_pairs(@ptrcast([*]u32, &row_gather_buf), PK,
+               @ptrcast([*]f32, &merge_dist_scratch),
+               @ptrcast([*]u32, &merge_idx_scratch));
+  select_top_k(PK,
+               @ptrcast([*]f32, &merge_dist_scratch),
+               @ptrcast([*]u32, &merge_idx_scratch),
+               @ptrcast([*]f32, &topk_dist),
+               @ptrcast([*]u32, &topk_idx),
+               K);
+  pack_topk_pairs();
+}
+
+// Final stage: at (P-1, P-1), reduce P*K col_gather pairs into out_dist / out_idx.
+fn col_merge_top_k() void {
+  unpack_pairs(@ptrcast([*]u32, &col_gather_buf), PK,
+               @ptrcast([*]f32, &merge_dist_scratch),
+               @ptrcast([*]u32, &merge_idx_scratch));
+  select_top_k(PK,
+               @ptrcast([*]f32, &merge_dist_scratch),
+               @ptrcast([*]u32, &merge_idx_scratch),
+               @ptrcast([*]f32, &out_dist_arr),
+               @ptrcast([*]u32, &out_idx_arr),
+               K);
+}
+
+// ---------------------------------------------------------------------------
+// State-machine driver. One task ID, hardware re-activates it on each callback.
+// ---------------------------------------------------------------------------
+task driver_task() void {
+  switch (state) {
+    0 => {
+      // Init collectives, capture coords.
+      mpi_x.init();
+      mpi_y.init();
+      px = mpi_x.pe_id;
+      py = mpi_y.pe_id;
+
+      // Step 1 of the q-broadcast: only column 0 actually has q, so only (0, *)
+      // run the column-broadcast. Other columns just bump the state machine.
+      if (px == 0) {
+        mpi_y.broadcast(0, @ptrcast([*]u32, &q_arr), d_dim, driver_task_id);
+      } else {
+        @activate(driver_task_id);
+      }
+      state += 1;
+    },
+
+    1 => {
+      // Step 2 of the q-broadcast: every row independently broadcasts q from
+      // its leftmost PE (which now has q after step 1) across to its rightmost.
+      mpi_x.broadcast(0, @ptrcast([*]u32, &q_arr), d_dim, driver_task_id);
+      state += 1;
+    },
+
+    2 => {
+      // Local compute: R squared L2 distances, then K-pass selection.
+      compute_local_distances();
+      select_top_k(R,
+                   @ptrcast([*]f32, &dist_arr),
+                   @ptrcast([*]u32, &idx_arr),
+                   @ptrcast([*]f32, &topk_dist),
+                   @ptrcast([*]u32, &topk_idx),
+                   K);
+      pack_topk_pairs();
+      @activate(driver_task_id);
+      state += 1;
+    },
+
+    3 => {
+      // Row gather: every row independently gathers its P PEs' top-K pair-arrays
+      // into row_gather_buf at (P-1, py).
+      mpi_x.gather(P - 1,
+                   @ptrcast([*]u32, &topk_pairs),
+                   @ptrcast([*]u32, &row_gather_buf),
+                   K * PAIR_U32,
+                   driver_task_id);
+      state += 1;
+    },
+
+    4 => {
+      // Row-merge runs only at (P-1, py); other PEs just step the machine.
+      if (px == P - 1) {
+        row_merge_top_k();
+      }
+      @activate(driver_task_id);
+      state += 1;
+    },
+
+    5 => {
+      // Column gather: only the rightmost column carries meaningful data, so
+      // only those PEs participate.
+      if (px == P - 1) {
+        mpi_y.gather(P - 1,
+                     @ptrcast([*]u32, &topk_pairs),
+                     @ptrcast([*]u32, &col_gather_buf),
+                     K * PAIR_U32,
+                     driver_task_id);
+      } else {
+        @activate(driver_task_id);
+      }
+      state += 1;
+    },
+
+    6 => {
+      if (px == P - 1 and py == P - 1) {
+        col_merge_top_k();
+      }
+      @activate(driver_task_id);
+      state += 1;
+    },
+
+    else => {
+      // Every PE must release its command-stream slot, not just the corner one.
+      sys_mod.unblock_cmd_stream();
+    },
+  }
+}
+
+// Host-callable kernel entry. Called once via runner.launch("kernel", ...).
+fn kernel() void {
+  state = 0;
+  @activate(driver_task_id);
+}
+
+comptime {
+  @bind_local_task(driver_task, driver_task_id);
+
+  @export_symbol(D_tile,   "D_tile");
+  @export_symbol(q_ptr,    "q");
+  @export_symbol(out_dist, "out_dist");
+  @export_symbol(out_idx,  "out_idx");
+  @export_symbol(kernel);
+}
