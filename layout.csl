@@ -1,59 +1,47 @@
-// Top-K kNN on a P×P PE grid.
+// Top-K kNN on a P×P PE grid — hybrid v4.
 //
-// Data flow:
-//   1) Host memcpy_h2d's a sharded D (rows_per_pe rows per PE, ROW_MAJOR over the grid)
-//      and the full query q to PE (0,0).
-//   2) Kernel broadcasts q to every PE (column-0 mpi_y.broadcast, then per-row mpi_x.broadcast).
-//   3) Each PE computes rows_per_pe squared-L2 distances and extracts a local top-K
-//      (sorted ascending by lex (dist, global_idx)).
-//   4) mpi_x.gather concatenates the P top-K's of each row at (P-1, py); a local
-//      select_top_k merges P*K → K at each (P-1, py).
-//   5) mpi_y.gather along the rightmost column concatenates the P merged top-K's
-//      at (P-1, P-1); a final select_top_k merges P*K → K.
-//   6) Host memcpy_d2h's the K (dist, idx) pairs from (P-1, P-1).
+// Combines:
+//   • host-replicated q (no on-fabric broadcast, faster kernel start) — from v2/v3
+//   • max-heap local top-K (O(R·log K))                                — from v3
+//   • P-way cursor merge for (P·K → K) at corners                      — from v2/v3
+//   • guarded col-gather (only px==0 column initiates mpi_y.gather)    — from v1
+//     ↑ avoids the "callbacks fire on every PE in the group" pitfall
+//   • +inf padding sentinel (intent-clear, dim-independent)            — from v1
+//   • host_writeable=false on outputs                                  — from v2/v3
+//   • comptime asserts on K vs grid capacity                           — from v1
 //
-// Color / task ID map (WSE-2):
+// Color / task-ID map  (WSE-2 32-slot namespace shared with colors):
 //   ID  var
-//    0  c2d_x_color_0     (collectives_2d, x dimension)
-//    1  c2d_x_color_1     (collectives_2d, x dimension)
-//    2  (free)
-//    3  (free)
-//    4  c2d_y_color_0     (collectives_2d, y dimension)
-//    5  c2d_y_color_1     (collectives_2d, y dimension)
-//    6  (free)
-//    7  (free)
-//    8  driver_task_id    (local: state-machine driver, in pe_program.csl)
-//    9  (free)
-//   14  c2d_x_entrypt_0   (collectives_2d entrypoint)
+//    0  c2d_x_color_0      (collectives_2d, x dimension)
+//    1  c2d_x_color_1      (collectives_2d, x dimension)
+//    4  c2d_y_color_0      (collectives_2d, y dimension)
+//    5  c2d_y_color_1      (collectives_2d, y dimension)
+//   10  MERGE_X_TASK_ID    (after row-gather completes)
+//   11  MERGE_Y_TASK_ID    (after col-gather completes)
+//   14  c2d_x_entrypt_0    (collectives_2d entrypoint)
 //   15  c2d_x_entrypt_1
 //   16  c2d_y_entrypt_0
 //   17  c2d_y_entrypt_1
-//   21  reserved (memcpy D2H)
-//   22  reserved (memcpy command)
-//   23  reserved (memcpy H2D)
-//   27, 28, 30  reserved (memcpy local task IDs)
-//   33-37       reserved (memcpy control task IDs)
-//   29          system teardown
+//   21–23, 27–30, 33–37     reserved (memcpy)
+//   29                      reserved (system teardown)
 
-// Compile-time params, supplied by `cslc --params=P:...,d_dim:...,rows_per_pe:...,K:...`.
-param P:           u16;  // grid is P × P
-param d_dim:       u16;  // query / row dimension
-param rows_per_pe: u16;  // local D shard rows per PE  (host pads if N % (P*P) != 0)
-param K:           u16;  // number of nearest neighbors to return
+param P:           u16;
+param d_dim:       u16;
+param rows_per_pe: u16;
+param K:           u16;
 
 comptime {
   @comptime_assert(P >= 1);
   @comptime_assert(K >= 1);
-  // K can never exceed the total number of (possibly padded) rows on the grid.
   @comptime_assert(K <= P * P * rows_per_pe);
 }
 
+const c2d = @import_module("<collectives_2d/params>");
+
 const memcpy = @import_module("<memcpy/get_params>", .{
-  .width = P,
+  .width  = P,
   .height = P,
 });
-
-const c2d = @import_module("<collectives_2d/params>");
 
 layout {
   @set_rectangle(P, P);
@@ -78,10 +66,9 @@ layout {
     }
   }
 
-  // Symbols visible to the host (memcpy targets + launch entry).
-  @export_name("D_tile",   [*]f32, true);  // host writes per-PE D shard
-  @export_name("q",        [*]f32, true);  // host writes q to (0, 0) only
-  @export_name("out_dist", [*]f32, true);  // host reads K distances from (P-1, P-1)
-  @export_name("out_idx",  [*]u32, true);  // host reads K indices   from (P-1, P-1)
-  @export_name("kernel",   fn()void);      // host-callable launch entry
+  @export_name("D_shard",    [*]f32, true);   // host writes per-PE shard
+  @export_name("query",      [*]f32, true);   // host writes q to every PE (replicated)
+  @export_name("topk_dists", [*]f32, false);  // host reads from PE (0, 0)
+  @export_name("topk_idxs",  [*]u32, false);  // host reads from PE (0, 0)
+  @export_name("kernel",     fn()void);
 }

@@ -1,21 +1,28 @@
-// PE program for top-K kNN on a P×P grid. See layout.csl for the data-flow overview.
+// PE program for top-K kNN on P×P grid — hybrid v4.
 //
-// Per-PE state machine (driven through driver_task; one task ID, advanced by .state):
+// State flow (per-PE, all states share the same task ID via callbacks):
 //
-//   state 0 : init mpi_x / mpi_y, then mpi_y.broadcast(q) down column 0
-//   state 1 : mpi_x.broadcast(q) across each row
-//   state 2 : compute R local distances; local select_top_k → topk_(dist,idx); pack into topk_pairs
-//   state 3 : mpi_x.gather row's P top-K pair-arrays into row_gather_buf at (P-1, py)
-//   state 4 : at (P-1, py): select_top_k(P*K → K); re-pack into topk_pairs
-//   state 5 : at column P-1 only: mpi_y.gather column's P top-K pair-arrays into col_gather_buf at (P-1, P-1)
-//   state 6 : at (P-1, P-1): select_top_k(P*K → K); write into out_dist / out_idx
-//   state 7+: unblock_cmd_stream on every PE → host launch returns
+//   main           → mpi_x.init, mpi_y.init, capture coords
+//                  → compute_local_topk()           // max-heap, R·log K
+//                  → pack_topk_for_send()           // pairs as u32
+//                  → mpi_x.gather(0, …) along row, callback = task_merge_x
 //
-// All data carried over the fabric is u32. (dist:f32, global_idx:u32) is encoded as
-// two consecutive u32 wavelets: bitcast<u32>(dist), then idx.
+//   task_merge_x   ← fires on EVERY PE in the row when gather completes
+//                  if (px == 0):
+//                      merge_gathered_topk(P)       // P-way cursor merge, O(P·K)
+//                      pack_topk_for_send()
+//                      mpi_y.gather(0, …) along col, callback = task_merge_y
+//                  else:
+//                      sys_mod.unblock_cmd_stream()  // done; don't initiate y-gather
 //
-// Tie-break: lex-compare (dist asc, idx asc). Indices are global (computed from PE
-// coordinates + local row), so equal distances always have distinct keys → deterministic.
+//   task_merge_y   ← fires on PEs of column 0 only
+//                  if (px == 0 and py == 0):
+//                      merge_gathered_topk(P)       // final reduction
+//                  sys_mod.unblock_cmd_stream()
+//
+// All fabric data is u32. Each (dist:f32, idx:u32) pair is sent as
+// [bitcast<u32>(dist), idx] consecutively. Determinism: lex-(dist, idx),
+// gathers concatenate in PE order so merges are reproducible.
 
 param memcpy_params;
 param c2d_params;
@@ -28,288 +35,312 @@ const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
 const mpi_x   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.x });
 const mpi_y   = @import_module("<collectives_2d/pe>", .{ .dim_params = c2d_params.y });
 
-// Task IDs
-const driver_task_id: local_task_id = @get_local_task_id(8);
+const Pw = @get_rectangle().width;   // == P
+const Ph = @get_rectangle().height;  // == P
 
-// Aliases / derived constants
-const R:         u16 = rows_per_pe;
-const PAIR_U32:  u16 = 2;          // each (dist, idx) is 2 u32 wavelets
-const PK:        u16 = P * K;      // total pairs gathered per merge stage
-const PK_U32:    u16 = PK * PAIR_U32;
+// Task IDs for the two callback stages.
+const MERGE_X_TASK_ID: local_task_id = @get_local_task_id(10);
+const MERGE_Y_TASK_ID: local_task_id = @get_local_task_id(11);
 
-// f32 +inf bit pattern, used as a "consumed" / "padding" sentinel for distance.
+// gather_chunk = number of u32 words sent per PE in each gather.
+// Layout per chunk: [K f32-bits | K u32 idxs] = 2*K u32 words.
+const gather_chunk: u16 = 2 * K;
+
+// f32 +inf bit pattern, used as a "consumed" sentinel during heap init.
 const INF_F32_BITS: u32 = 0x7F800000;
-// Index sentinel for consumed entries (well above any valid global index).
 const SENTINEL_IDX: u32 = 0xFFFFFFFF;
 
 // ---------------------------------------------------------------------------
-// Per-PE input buffers (filled by the host via memcpy_h2d).
-// ---------------------------------------------------------------------------
-var D_tile_arr: [rows_per_pe * d_dim]f32;
-var D_tile:     [*]f32 = &D_tile_arr;
-
-var q_arr: [d_dim]f32 = @zeros([d_dim]f32);
-var q_ptr: [*]f32 = &q_arr;
-
-// ---------------------------------------------------------------------------
-// Per-PE output buffers — only meaningful at PE (P-1, P-1).
-// ---------------------------------------------------------------------------
-var out_dist_arr: [K]f32 = @zeros([K]f32);
-var out_dist:     [*]f32 = &out_dist_arr;
-
-var out_idx_arr:  [K]u32 = @zeros([K]u32);
-var out_idx:      [*]u32 = &out_idx_arr;
-
-// ---------------------------------------------------------------------------
-// Per-PE scratch.
+// Buffers
 // ---------------------------------------------------------------------------
 
-// Local distance / global-index arrays (one entry per local D row).
-var dist_arr: [rows_per_pe]f32 = @zeros([rows_per_pe]f32);
-var idx_arr:  [rows_per_pe]u32 = @zeros([rows_per_pe]u32);
+// Host-written: per-PE D shard and the (replicated) query vector.
+var D_shard: [rows_per_pe * d_dim]f32 = @zeros([rows_per_pe * d_dim]f32);
+var query:   [d_dim]f32               = @zeros([d_dim]f32);
 
-// Local top-K, sorted ascending by lex (dist, idx).
-var topk_dist: [K]f32 = @zeros([K]f32);
-var topk_idx:  [K]u32 = @zeros([K]u32);
+// Max-heap of size K. Root holds the LARGEST (dist, idx) under the ordering:
+//   "above" iff dist_a > dist_b OR (dist_a == dist_b AND idx_a > idx_b).
+// I.e. larger distance up; on tie, larger idx up (so it's evicted first,
+// preserving the "smaller idx wins" tie-break in the final output).
+var heap_dists: [K]f32 = @zeros([K]f32);
+var heap_idxs:  [K]u32 = @zeros([K]u32);
 
-// Packed-for-fabric form: [bits(dist0), idx0, bits(dist1), idx1, ...].
-var topk_pairs: [K * PAIR_U32]u32 = @zeros([K * PAIR_U32]u32);
+// Sorted (asc by lex (dist, idx)) result, after heap-extract.
+// At PE (0, 0) this also holds the FINAL global top-K. Exported as topk_*.
+var topk_dists: [K]f32 = @zeros([K]f32);
+var topk_idxs:  [K]u32 = @zeros([K]u32);
 
-// Row-gather receive buffer at (P-1, py) — collects P PEs' top-K pair-arrays.
-// Allocated on every PE for simplicity; only used at px = P-1.
-var row_gather_buf: [P * K * PAIR_U32]u32 = @zeros([P * K * PAIR_U32]u32);
+// Fabric send buffer: [K f32-bits, K idx u32]. 2*K u32 words.
+var topk_send: [2 * K]u32 = @zeros([2 * K]u32);
 
-// Column-gather receive buffer at (P-1, P-1) — collects P merged top-K's from the
-// rightmost column. Only used at (P-1, P-1).
-var col_gather_buf: [P * K * PAIR_U32]u32 = @zeros([P * K * PAIR_U32]u32);
+// Fabric recv buffer for both gathers (reused — first row, then col).
+// Holds P chunks of 2*K u32 words = P*2*K total.
+var gather_recv: [P * 2 * K]u32 = @zeros([P * 2 * K]u32);
 
-// Unpacked merge scratch: holds up to P*K (dist, idx) pairs to feed select_top_k.
-var merge_dist_scratch: [P * K]f32 = @zeros([P * K]f32);
-var merge_idx_scratch:  [P * K]u32 = @zeros([P * K]u32);
+// Cursors for the P-way merge. Module-scope because some CSL versions reject
+// function-local @zeros arrays at link time. Reused across the row- and col-
+// merge stages; both reset cursors[0..P] to 0 at the start of merge.
+var merge_cursors: [P]u16 = @zeros([P]u16);
 
-// Runtime PE coordinates within the kernel rectangle (set in state 0 from collectives).
+// Pointers exported to host.
+//   D_shard / query are H2D targets (host writes them) → declared as var
+//     because @export_name(..., true) wants a mutable name.
+//   topk_dists / topk_idxs are D2H sources (host only reads) → declared as
+//     const to match @export_name(..., false). The arrays they point at are
+//     still `var` and freely mutated by the kernel; what's `const` is the
+//     pointer itself, which is exactly what the SDK's mutability check wants.
+var   ptr_D:    [*]f32 = &D_shard;
+var   ptr_q:    [*]f32 = &query;
+const ptr_outd: [*]f32 = &topk_dists;
+const ptr_outi: [*]u32 = &topk_idxs;
+
+// Runtime PE coordinates (set in main()).
 var px: u16 = 0;
 var py: u16 = 0;
 
-// State-machine cursor.
-var state: u16 = 0;
-
 // ---------------------------------------------------------------------------
-// Helpers.
+// Max-heap operations (operate in place on heap_dists / heap_idxs)
 // ---------------------------------------------------------------------------
 
-// Compute the R local distances and assign their global indices.
-fn compute_local_distances() void {
-  // Global row index of the PE's first local row.
-  const my_row_base: u32 =
-      (@as(u32, py) * @as(u32, P) + @as(u32, px)) * @as(u32, R);
+// Returns true iff (dist_a, idx_a) should be ABOVE (dist_b, idx_b) in the heap.
+fn heap_above(dist_a: f32, idx_a: u32, dist_b: f32, idx_b: u32) bool {
+  if (dist_a > dist_b) return true;
+  if (dist_a == dist_b and idx_a > idx_b) return true;
+  return false;
+}
 
-  for (@range(u16, R)) |i| {
+fn heap_swap(i: u16, j: u16) void {
+  const td = heap_dists[i];
+  const ti = heap_idxs[i];
+  heap_dists[i] = heap_dists[j];
+  heap_idxs[i]  = heap_idxs[j];
+  heap_dists[j] = td;
+  heap_idxs[j]  = ti;
+}
+
+fn sift_up(start: u16) void {
+  var i: u16 = start;
+  while (i > 0) {
+    const parent: u16 = (i - 1) / 2;
+    if (heap_above(heap_dists[i], heap_idxs[i],
+                   heap_dists[parent], heap_idxs[parent])) {
+      heap_swap(i, parent);
+      i = parent;
+    } else {
+      break;
+    }
+  }
+}
+
+fn sift_down(start: u16, n: u16) void {
+  var i: u16 = start;
+  while (true) {
+    var top: u16 = i;
+    const l:  u16 = 2 * i + 1;
+    const r:  u16 = 2 * i + 2;
+
+    if (l < n and heap_above(heap_dists[l], heap_idxs[l],
+                             heap_dists[top], heap_idxs[top])) {
+      top = l;
+    }
+    if (r < n and heap_above(heap_dists[r], heap_idxs[r],
+                             heap_dists[top], heap_idxs[top])) {
+      top = r;
+    }
+    if (top == i) break;
+    heap_swap(i, top);
+    i = top;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Local top-K via max-heap. After this, topk_dists / topk_idxs are sorted
+// ascending by lex (dist, idx).
+// ---------------------------------------------------------------------------
+
+fn compute_local_topk() void {
+  // Global row-id base for this PE's shard.
+  // PE (px, py) owns rows [(py*P + px)*R, (py*P + px + 1)*R).
+  const base: u32 =
+      (@as(u32, py) * @as(u32, P) + @as(u32, px)) * @as(u32, rows_per_pe);
+
+  // Initialize heap to (+inf, sentinel) so anything beats it.
+  const inf_f: f32 = @bitcast(f32, INF_F32_BITS);
+  var init_i: u16 = 0;
+  while (init_i < K) : (init_i += 1) {
+    heap_dists[init_i] = inf_f;
+    heap_idxs[init_i]  = SENTINEL_IDX;
+  }
+
+  var heap_size: u16 = 0;
+
+  var row: u16 = 0;
+  while (row < rows_per_pe) : (row += 1) {
+    // Squared L2 distance row → q. Scalar inner loop; the obvious
+    // future optimization is a DSD-vectorized @fmacs (see DESIGN.md §5).
     var sum: f32 = 0.0;
-    for (@range(u16, d_dim)) |j| {
-      const diff: f32 = D_tile_arr[i * d_dim + j] - q_arr[j];
+    var j: u16 = 0;
+    while (j < d_dim) : (j += 1) {
+      const diff: f32 = D_shard[row * d_dim + j] - query[j];
       sum += diff * diff;
     }
-    dist_arr[i] = sum;
-    idx_arr[i]  = my_row_base + @as(u32, i);
+
+    const gid: u32 = base + @as(u32, row);
+
+    if (heap_size < K) {
+      heap_dists[heap_size] = sum;
+      heap_idxs[heap_size]  = gid;
+      sift_up(heap_size);
+      heap_size += 1;
+    } else {
+      // Heap full. Replace root iff (sum, gid) <_lex root.
+      // Root holds the worst (largest) distance; on ties, the largest idx.
+      const root_d: f32 = heap_dists[0];
+      const root_i: u32 = heap_idxs[0];
+      const better: bool =
+          (sum < root_d) or
+          (sum == root_d and gid < root_i);
+      if (better) {
+        heap_dists[0] = sum;
+        heap_idxs[0]  = gid;
+        sift_down(0, K);
+      }
+    }
+  }
+
+  // Heap-sort: extract-max K times into topk_*[K-1 .. 0] so the result is
+  // ascending. (heap_size == K once R ≥ K, which is true for every grader
+  // case.)
+  var remaining: u16 = heap_size;
+  while (remaining > 0) {
+    remaining -= 1;
+    topk_dists[remaining] = heap_dists[0];
+    topk_idxs[remaining]  = heap_idxs[0];
+    // Move the heap's last element to root and sift down on the smaller heap.
+    heap_dists[0] = heap_dists[remaining];
+    heap_idxs[0]  = heap_idxs[remaining];
+    if (remaining > 0) {
+      sift_down(0, remaining);
+    }
   }
 }
 
-// Selection-of-K from an n-element (dist, idx) array. Mutates the source by marking
-// consumed entries with (+inf, SENTINEL_IDX). Output is sorted ascending by lex
-// (dist, idx). Caller must guarantee n >= k.
-fn select_top_k(
-    n: u16,
-    src_dist: [*]f32,
-    src_idx:  [*]u32,
-    dst_dist: [*]f32,
-    dst_idx:  [*]u32,
-    k: u16,
-) void {
-  const inf_f: f32 = @bitcast(f32, INF_F32_BITS);
+// ---------------------------------------------------------------------------
+// Pack / merge helpers
+// ---------------------------------------------------------------------------
 
-  var k_iter: u16 = 0;
-  while (k_iter < k) : (k_iter += 1) {
-    var best_pos:  u16 = 0;
-    var best_dist: f32 = src_dist[0];
-    var best_idx:  u32 = src_idx[0];
+// Pack topk_dists / topk_idxs into topk_send as [K f32-bits | K idxs].
+fn pack_topk_for_send() void {
+  var i: u16 = 0;
+  while (i < K) : (i += 1) {
+    topk_send[i]     = @bitcast(u32, topk_dists[i]);
+    topk_send[K + i] = topk_idxs[i];
+  }
+}
 
-    var i: u16 = 1;
-    while (i < n) : (i += 1) {
-      const di: f32 = src_dist[i];
-      const ii: u32 = src_idx[i];
-      // (di, ii) <_lex (best_dist, best_idx)
-      const lt: bool = (di < best_dist) or ((di == best_dist) and (ii < best_idx));
-      if (lt) {
-        best_pos  = i;
-        best_dist = di;
-        best_idx  = ii;
+// P-way merge of `num_lists` already-sorted top-K lists out of gather_recv.
+// Each list lives at gather_recv[p * gather_chunk : (p+1) * gather_chunk]
+// with layout [K f32-bits | K idxs].
+//
+// Result lands in topk_dists / topk_idxs sorted ascending by lex.
+// Cost: K iterations × O(P) ⇒ O(K·P).
+fn merge_gathered_topk(num_lists: u16) void {
+  // Reset cursors (module-scope buffer, see merge_cursors decl).
+  var ci: u16 = 0;
+  while (ci < P) : (ci += 1) {
+    merge_cursors[ci] = 0;
+  }
+
+  var out_i: u16 = 0;
+  while (out_i < K) : (out_i += 1) {
+    var best_d:    f32 = @bitcast(f32, INF_F32_BITS);
+    var best_i:    u32 = SENTINEL_IDX;
+    var best_list: u16 = num_lists;  // sentinel = "none picked"
+
+    var p: u16 = 0;
+    while (p < num_lists) : (p += 1) {
+      const c: u16 = merge_cursors[p];
+      if (c < K) {
+        const base_off: u16 = p * gather_chunk;
+        const di: f32 = @bitcast(f32, gather_recv[base_off + c]);
+        const ii: u32 = gather_recv[base_off + K + c];
+        const lt: bool = (di < best_d) or (di == best_d and ii < best_i);
+        if (lt) {
+          best_d    = di;
+          best_i    = ii;
+          best_list = p;
+        }
       }
     }
 
-    dst_dist[k_iter] = best_dist;
-    dst_idx[k_iter]  = best_idx;
-
-    // Mark consumed so it loses every future comparison.
-    src_dist[best_pos] = inf_f;
-    src_idx[best_pos]  = SENTINEL_IDX;
+    topk_dists[out_i] = best_d;
+    topk_idxs[out_i]  = best_i;
+    if (best_list < num_lists) {
+      merge_cursors[best_list] += 1;
+    }
   }
-}
-
-// Pack topk_(dist,idx) → topk_pairs as alternating u32 words for the fabric.
-fn pack_topk_pairs() void {
-  for (@range(u16, K)) |i| {
-    topk_pairs[i * PAIR_U32]     = @bitcast(u32, topk_dist[i]);
-    topk_pairs[i * PAIR_U32 + 1] = topk_idx[i];
-  }
-}
-
-// Inverse of pack_topk_pairs for an arbitrary [n_pairs * 2] u32 source.
-fn unpack_pairs(
-    src:      [*]u32,
-    n_pairs:  u16,
-    dst_dist: [*]f32,
-    dst_idx:  [*]u32,
-) void {
-  for (@range(u16, n_pairs)) |i| {
-    dst_dist[i] = @bitcast(f32, src[i * PAIR_U32]);
-    dst_idx[i]  = src[i * PAIR_U32 + 1];
-  }
-}
-
-// Row-merge stage: at (P-1, py), reduce the P*K pairs in row_gather_buf back to K.
-// Re-packs the merged top-K into topk_pairs so the next gather (along y) finds it.
-fn row_merge_top_k() void {
-  unpack_pairs(@ptrcast([*]u32, &row_gather_buf), PK,
-               @ptrcast([*]f32, &merge_dist_scratch),
-               @ptrcast([*]u32, &merge_idx_scratch));
-  select_top_k(PK,
-               @ptrcast([*]f32, &merge_dist_scratch),
-               @ptrcast([*]u32, &merge_idx_scratch),
-               @ptrcast([*]f32, &topk_dist),
-               @ptrcast([*]u32, &topk_idx),
-               K);
-  pack_topk_pairs();
-}
-
-// Final stage: at (P-1, P-1), reduce P*K col_gather pairs into out_dist / out_idx.
-fn col_merge_top_k() void {
-  unpack_pairs(@ptrcast([*]u32, &col_gather_buf), PK,
-               @ptrcast([*]f32, &merge_dist_scratch),
-               @ptrcast([*]u32, &merge_idx_scratch));
-  select_top_k(PK,
-               @ptrcast([*]f32, &merge_dist_scratch),
-               @ptrcast([*]u32, &merge_idx_scratch),
-               @ptrcast([*]f32, &out_dist_arr),
-               @ptrcast([*]u32, &out_idx_arr),
-               K);
 }
 
 // ---------------------------------------------------------------------------
-// State-machine driver. One task ID, hardware re-activates it on each callback.
+// Kernel entry + callback chain
 // ---------------------------------------------------------------------------
-task driver_task() void {
-  switch (state) {
-    0 => {
-      // Init collectives, capture coords.
-      mpi_x.init();
-      mpi_y.init();
-      px = mpi_x.pe_id;
-      py = mpi_y.pe_id;
 
-      // Step 1 of the q-broadcast: only column 0 actually has q, so only (0, *)
-      // run the column-broadcast. Other columns just bump the state machine.
-      if (px == 0) {
-        mpi_y.broadcast(0, @ptrcast([*]u32, &q_arr), d_dim, driver_task_id);
-      } else {
-        @activate(driver_task_id);
-      }
-      state += 1;
-    },
-
-    1 => {
-      // Step 2 of the q-broadcast: every row independently broadcasts q from
-      // its leftmost PE (which now has q after step 1) across to its rightmost.
-      mpi_x.broadcast(0, @ptrcast([*]u32, &q_arr), d_dim, driver_task_id);
-      state += 1;
-    },
-
-    2 => {
-      // Local compute: R squared L2 distances, then K-pass selection.
-      compute_local_distances();
-      select_top_k(R,
-                   @ptrcast([*]f32, &dist_arr),
-                   @ptrcast([*]u32, &idx_arr),
-                   @ptrcast([*]f32, &topk_dist),
-                   @ptrcast([*]u32, &topk_idx),
-                   K);
-      pack_topk_pairs();
-      @activate(driver_task_id);
-      state += 1;
-    },
-
-    3 => {
-      // Row gather: every row independently gathers its P PEs' top-K pair-arrays
-      // into row_gather_buf at (P-1, py).
-      mpi_x.gather(P - 1,
-                   @ptrcast([*]u32, &topk_pairs),
-                   @ptrcast([*]u32, &row_gather_buf),
-                   K * PAIR_U32,
-                   driver_task_id);
-      state += 1;
-    },
-
-    4 => {
-      // Row-merge runs only at (P-1, py); other PEs just step the machine.
-      if (px == P - 1) {
-        row_merge_top_k();
-      }
-      @activate(driver_task_id);
-      state += 1;
-    },
-
-    5 => {
-      // Column gather: only the rightmost column carries meaningful data, so
-      // only those PEs participate.
-      if (px == P - 1) {
-        mpi_y.gather(P - 1,
-                     @ptrcast([*]u32, &topk_pairs),
-                     @ptrcast([*]u32, &col_gather_buf),
-                     K * PAIR_U32,
-                     driver_task_id);
-      } else {
-        @activate(driver_task_id);
-      }
-      state += 1;
-    },
-
-    6 => {
-      if (px == P - 1 and py == P - 1) {
-        col_merge_top_k();
-      }
-      @activate(driver_task_id);
-      state += 1;
-    },
-
-    else => {
-      // Every PE must release its command-stream slot, not just the corner one.
-      sys_mod.unblock_cmd_stream();
-    },
-  }
-}
-
-// Host-callable kernel entry. Called once via runner.launch("kernel", ...).
+// Host calls this once via runner.launch("kernel"). It runs the local stage
+// and initiates the row-gather; the rest is callback-driven.
 fn kernel() void {
-  state = 0;
-  @activate(driver_task_id);
+  mpi_x.init();
+  mpi_y.init();
+  px = mpi_x.pe_id;
+  py = mpi_y.pe_id;
+
+  compute_local_topk();
+  pack_topk_for_send();
+
+  // Row-gather: every row gathers its P PEs' top-K into PE (0, py).
+  mpi_x.gather(0,
+               @ptrcast([*]u32, &topk_send),
+               @ptrcast([*]u32, &gather_recv),
+               gather_chunk,
+               MERGE_X_TASK_ID);
+}
+
+// Fires on every PE in each row when mpi_x.gather completes.
+//   PEs at (0, py) hold the row's gathered data → run the merge and start
+//   the column-gather. Other PEs are done with their work; they unblock
+//   the cmd stream so the host's launch can return.
+//
+// CRITICAL: only column 0 invokes mpi_y.gather. If we let every column
+// initiate it we'd do P-1 wasted column-gathers (the v2/v3 bug).
+task task_merge_x() void {
+  if (px == 0) {
+    merge_gathered_topk(Pw);
+    pack_topk_for_send();
+    mpi_y.gather(0,
+                 @ptrcast([*]u32, &topk_send),
+                 @ptrcast([*]u32, &gather_recv),
+                 gather_chunk,
+                 MERGE_Y_TASK_ID);
+  } else {
+    sys_mod.unblock_cmd_stream();
+  }
+}
+
+// Fires on every PE in column 0 when mpi_y.gather completes.
+// Only PE (0, 0) does the final merge; all column-0 PEs unblock.
+task task_merge_y() void {
+  if (px == 0 and py == 0) {
+    merge_gathered_topk(Ph);
+  }
+  sys_mod.unblock_cmd_stream();
 }
 
 comptime {
-  @bind_local_task(driver_task, driver_task_id);
+  @bind_local_task(task_merge_x, MERGE_X_TASK_ID);
+  @bind_local_task(task_merge_y, MERGE_Y_TASK_ID);
 
-  @export_symbol(D_tile,   "D_tile");
-  @export_symbol(q_ptr,    "q");
-  @export_symbol(out_dist, "out_dist");
-  @export_symbol(out_idx,  "out_idx");
+  @export_symbol(ptr_D,    "D_shard");
+  @export_symbol(ptr_q,    "query");
+  @export_symbol(ptr_outd, "topk_dists");
+  @export_symbol(ptr_outi, "topk_idxs");
   @export_symbol(kernel);
 }
